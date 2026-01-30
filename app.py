@@ -110,7 +110,7 @@ Titre: {metadata.get('title')}
 TRANSCRIPTION:
 {transcript[:4000]}
 
-5-7 points clés numérotés.""",
+5-7 points clés.""",
         
         'paragraph': f"""Résumé en paragraphe fluide en français.
 
@@ -211,3 +211,18 @@ def process_video():
             'metadata': transcript_data['metadata'],
             'credits_remaining': credits - 1
         }), 200
+        
+    except Exception as e:
+        logger.error(f"Erreur: {str(e)}")
+        return jsonify({'error': 'Erreur serveur'}), 500
+
+if __name__ == '__main__':
+    required_env = ['OPENAI_API_KEY', 'SUPABASE_URL', 'SUPABASE_SERVICE_KEY']
+    missing = [var for var in required_env if not os.getenv(var)]
+    
+    if missing:
+        logger.error(f"Variables manquantes: {', '.join(missing)}")
+        exit(1)
+    
+    port = int(os.getenv('PORT', 8080))
+    app.run(host='0.0.0.0', port=port, debug=False)
