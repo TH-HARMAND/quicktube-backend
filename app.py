@@ -193,3 +193,21 @@ def process_video():
             'summary': summary,
             'language': transcript_data['language'],
             'style': style,
+            'created_at': datetime.utcnow().isoformat()
+        }
+        
+        insert_response = supabase.table('summaries').insert(summary_record).execute()
+        
+        supabase.table('profiles').update({
+            'credits_remaining': credits - 1
+        }).eq('id', user_id).execute()
+        
+        logger.info(f"Succès - ID: {insert_response.data[0]['id']}")
+        
+        return jsonify({
+            'success': True,
+            'summary_id': insert_response.data[0]['id'],
+            'summary': summary,
+            'metadata': transcript_data['metadata'],
+            'credits_remaining': credits - 1
+        }), 200
