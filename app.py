@@ -1,11 +1,11 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import os
-from openai import OpenAI
 import logging
 from supabase import create_client
 from datetime import datetime
-import requests
+import google.generativeai as genai
+import re
 
 app = Flask(__name__)
 CORS(app, origins=os.getenv('ALLOWED_ORIGINS', '*').split(','))
@@ -13,17 +13,16 @@ CORS(app, origins=os.getenv('ALLOWED_ORIGINS', '*').split(','))
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-openai_client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
 supabase = create_client(
     os.getenv('SUPABASE_URL'),
     os.getenv('SUPABASE_SERVICE_KEY')
 )
 
-YOUTUBE_API_KEY = os.getenv('YOUTUBE_API_KEY')
+# Configuration Gemini
+genai.configure(api_key=os.getenv('GEMINI_API_KEY'))
 
 def extract_video_id(url):
     """Extrait l'ID de la vidéo depuis l'URL YouTube"""
-    import re
     patterns = [
         r'(?:youtube\.com\/watch\?v=|youtu\.be\/)([^&\n?#]+)',
         r'youtube\.com\/embed\/([^&\n?#]+)',
@@ -35,180 +34,80 @@ def extract_video_id(url):
             return match.group(1)
     return None
 
-def get_video_info(video_id):
-    """Récupère les infos de la vidéo via l'API YouTube"""
+def get_video_metadata(video_id):
+    """Récupère les métadonnées basiques de la vidéo"""
     try:
-        url = f"https://www.googleapis.com/youtube/v3/videos"
-        params = {
-            'part': 'snippet,contentDetails,statistics',
-            'id': video_id,
-            'key': YOUTUBE_API_KEY
-        }
-        
-        response = requests.get(url, params=params)
+        import requests
+        url = f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={video_id}&format=json"
+        response = requests.get(url)
         response.raise_for_status()
         data = response.json()
-        
-        if not data.get('items'):
-            return None, "Vidéo non trouvée"
-        
-        video = data['items'][0]
-        snippet = video['snippet']
-        content = video['contentDetails']
-        stats = video['statistics']
-        
-        # Parser la durée ISO 8601 (PT1H2M10S -> secondes)
-        import re
-        duration_str = content['duration']
-        duration_match = re.match(r'PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?', duration_str)
-        hours = int(duration_match.group(1) or 0)
-        minutes = int(duration_match.group(2) or 0)
-        seconds = int(duration_match.group(3) or 0)
-        duration_seconds = hours * 3600 + minutes * 60 + seconds
         
         return {
-            'title': snippet['title'],
-            'channel': snippet['channelTitle'],
-            'duration': duration_seconds,
-            'thumbnail': snippet['thumbnails']['high']['url'],
-            'view_count': int(stats.get('viewCount', 0)),
-            'upload_date': snippet['publishedAt']
+            'title': data.get('title'),
+            'channel': data.get('author_name'),
+            'thumbnail': data.get('thumbnail_url'),
         }, None
-        
     except Exception as e:
-        logger.error(f"Erreur récupération infos vidéo: {str(e)}")
+        logger.error(f"Erreur métadonnées: {str(e)}")
         return None, str(e)
 
-def get_transcript(video_id):
-    """Récupère la transcription via l'API YouTube"""
-    try:
-        # Étape 1 : Récupérer la liste des sous-titres
-        url = f"https://www.googleapis.com/youtube/v3/captions"
-        params = {
-            'part': 'snippet',
-            'videoId': video_id,
-            'key': YOUTUBE_API_KEY
-        }
-        
-        response = requests.get(url, params=params)
-        response.raise_for_status()
-        data = response.json()
-        
-        if not data.get('items'):
-            return None, "Aucun sous-titre disponible", None
-        
-        # Prioriser français puis anglais
-        caption_id = None
-        language = None
-        
-        for item in data['items']:
-            lang = item['snippet']['language']
-            if lang == 'fr':
-                caption_id = item['id']
-                language = 'fr'
-                break
-            elif lang == 'en' and not caption_id:
-                caption_id = item['id']
-                language = 'en'
-        
-        if not caption_id:
-            # Prendre le premier disponible
-            caption_id = data['items'][0]['id']
-            language = data['items'][0]['snippet']['language']
-        
-        # Étape 2 : Télécharger le sous-titre
-        # Note : L'API YouTube Data v3 ne permet PAS de télécharger directement les sous-titres
-        # Il faut utiliser youtube-transcript-api (bibliothèque Python) à la place
-        
-        from youtube_transcript_api import YouTubeTranscriptApi
-        
-        try:
-            # Essayer français puis anglais
-            transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-            
-            transcript = None
-            try:
-                transcript = transcript_list.find_transcript(['fr'])
-                language = 'fr'
-            except:
-                try:
-                    transcript = transcript_list.find_transcript(['en'])
-                    language = 'en'
-                except:
-                    transcript = transcript_list.find_generated_transcript(['fr', 'en'])
-                    language = transcript.language_code
-            
-            transcript_data = transcript.fetch()
-            transcript_text = ' '.join([entry['text'] for entry in transcript_data])
-            
-            return transcript_text, None, language
-            
-        except Exception as e:
-            logger.error(f"Erreur téléchargement transcription: {str(e)}")
-            return None, str(e), None
-        
-    except Exception as e:
-        logger.error(f"Erreur API YouTube: {str(e)}")
-        return None, str(e), None
-
-def generate_summary(transcript, metadata, style='structured'):
-    """Génère un résumé avec OpenAI GPT-4"""
+def generate_summary_with_gemini(video_url, style='structured'):
+    """Génère un résumé avec Gemini en analysant directement la vidéo YouTube"""
     
     prompts = {
-        'structured': f"""Analyse cette transcription et crée un résumé structuré en français.
+        'structured': f"""Analyse cette vidéo YouTube et crée un résumé structuré en français.
 
-Titre: {metadata.get('title')}
+URL: {video_url}
 
-TRANSCRIPTION:
-{transcript[:4000]}
-
-FORMAT:
+FORMAT EXACT À SUIVRE:
 ## 📝 Résumé Principal
-[2-3 phrases]
+[2-3 phrases de synthèse globale]
 
 ## 🎯 Points Clés
-- Point 1
-- Point 2
-- Point 3
+- Point important 1
+- Point important 2
+- Point important 3
 
 ## 💡 Idées Principales
-[Développement]
+[Développement des concepts clés abordés dans la vidéo]
 
 ## 🔑 Conclusion
-[Takeaway]""",
+[Takeaway principal en 1-2 phrases]
+
+Réponds uniquement en français, en suivant exactement cette structure.""",
         
-        'bullets': f"""Résume en bullet points en français.
+        'bullets': f"""Analyse cette vidéo YouTube et résume-la en bullet points concis en français.
 
-Titre: {metadata.get('title')}
+URL: {video_url}
 
-TRANSCRIPTION:
-{transcript[:4000]}
-
-5-7 points clés.""",
+Fournis 5-7 points clés numérotés qui capturent l'essentiel du contenu de la vidéo.
+Réponds uniquement en français.""",
         
-        'paragraph': f"""Résumé en paragraphe fluide en français.
+        'paragraph': f"""Analyse cette vidéo YouTube et écris un paragraphe de résumé fluide en français.
 
-Titre: {metadata.get('title')}
+URL: {video_url}
 
-TRANSCRIPTION:
-{transcript[:4000]}
-
-1 paragraphe de 4-6 phrases."""
+Rédige 1 paragraphe de 4-6 phrases qui résume l'essentiel de la vidéo de manière naturelle.
+Réponds uniquement en français."""
     }
     
     try:
-        response = openai_client.chat.completions.create(
-            model="gpt-4",
-            messages=[
-                {"role": "system", "content": "Tu es expert en résumé de vidéos."},
-                {"role": "user", "content": prompts.get(style, prompts['structured'])}
-            ],
-            temperature=0.7,
-            max_tokens=1000
-        )
-        return response.choices[0].message.content, None
+        # Utiliser Gemini 1.5 Flash (le moins cher et suffisant)
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        
+        prompt = prompts.get(style, prompts['structured'])
+        
+        logger.info(f"Envoi requête Gemini pour {video_url}")
+        response = model.generate_content(prompt)
+        
+        summary = response.text
+        logger.info(f"Résumé reçu: {len(summary)} caractères")
+        
+        return summary, None
+        
     except Exception as e:
-        logger.error(f"Erreur résumé: {str(e)}")
+        logger.error(f"Erreur Gemini: {str(e)}")
         return None, str(e)
 
 @app.route('/health', methods=['GET'])
@@ -216,7 +115,7 @@ def health_check():
     return jsonify({
         'status': 'healthy',
         'service': 'quicktube-backend',
-        'version': 'youtube-api',
+        'version': 'gemini-api',
         'timestamp': datetime.utcnow().isoformat()
     })
 
@@ -247,23 +146,21 @@ def process_video():
         if credits <= 0:
             return jsonify({'error': 'Crédits épuisés'}), 403
         
-        # Récupérer les infos de la vidéo
-        logger.info(f"Récupération infos pour video_id={video_id}")
-        metadata, error = get_video_info(video_id)
+        # Récupérer les métadonnées de base
+        logger.info(f"Récupération métadonnées pour video_id={video_id}")
+        metadata, error = get_video_metadata(video_id)
         
         if error:
-            return jsonify({'error': f'Infos vidéo échouées: {error}'}), 500
+            # Si les métadonnées échouent, on continue quand même avec Gemini
+            metadata = {
+                'title': 'Vidéo YouTube',
+                'channel': 'Inconnu',
+                'thumbnail': f'https://img.youtube.com/vi/{video_id}/hqdefault.jpg'
+            }
         
-        # Récupérer la transcription
-        logger.info(f"Récupération transcription pour video_id={video_id}")
-        transcript, error, language = get_transcript(video_id)
-        
-        if error:
-            return jsonify({'error': f'Transcription échouée: {error}'}), 500
-        
-        # Générer le résumé
-        logger.info(f"Génération résumé style={style}")
-        summary, error = generate_summary(transcript, metadata, style)
+        # Générer le résumé avec Gemini (analyse directe de la vidéo)
+        logger.info(f"Génération résumé Gemini style={style}")
+        summary, error = generate_summary_with_gemini(video_url, style)
         
         if error:
             return jsonify({'error': f'Résumé échoué: {error}'}), 500
@@ -273,12 +170,12 @@ def process_video():
             'user_id': user_id,
             'video_url': video_url,
             'video_title': metadata.get('title'),
-            'video_duration': metadata.get('duration'),
+            'video_duration': None,  # Gemini ne retourne pas la durée
             'thumbnail_url': metadata.get('thumbnail'),
             'channel_name': metadata.get('channel'),
-            'transcript': transcript,
+            'transcript': summary,  # On stocke le résumé comme "transcript"
             'summary': summary,
-            'language': language,
+            'language': 'fr',
             'style': style,
             'created_at': datetime.utcnow().isoformat()
         }
@@ -305,7 +202,7 @@ def process_video():
         return jsonify({'error': 'Erreur serveur'}), 500
 
 if __name__ == '__main__':
-    required_env = ['OPENAI_API_KEY', 'SUPABASE_URL', 'SUPABASE_SERVICE_KEY', 'YOUTUBE_API_KEY']
+    required_env = ['SUPABASE_URL', 'SUPABASE_SERVICE_KEY', 'GEMINI_API_KEY']
     missing = [var for var in required_env if not os.getenv(var)]
     
     if missing:
@@ -314,3 +211,5 @@ if __name__ == '__main__':
     
     port = int(os.getenv('PORT', 8080))
     app.run(host='0.0.0.0', port=port, debug=False)
+```
+
