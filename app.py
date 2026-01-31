@@ -5,6 +5,7 @@ import logging
 from supabase import create_client
 from datetime import datetime
 import google.generativeai as genai
+import yt_dlp
 import re
 
 app = Flask(__name__)
@@ -18,7 +19,6 @@ supabase = create_client(
     os.getenv('SUPABASE_SERVICE_KEY')
 )
 
-# Configuration Gemini
 genai.configure(api_key=os.getenv('GEMINI_API_KEY'))
 
 def extract_video_id(url):
@@ -34,77 +34,118 @@ def extract_video_id(url):
             return match.group(1)
     return None
 
-def get_video_metadata(video_id):
-    """Récupère les métadonnées basiques de la vidéo"""
+def get_transcript(video_url):
+    """Extrait la transcription avec yt-dlp"""
     try:
-        import requests
-        url = f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={video_id}&format=json"
-        response = requests.get(url)
-        response.raise_for_status()
-        data = response.json()
+        ydl_opts = {
+            'skip_download': True,
+            'writesubtitles': True,
+            'writeautomaticsub': True,
+            'subtitleslangs': ['fr', 'en'],
+            'quiet': True,
+            'no_warnings': True,
+        }
         
-        return {
-            'title': data.get('title'),
-            'channel': data.get('author_name'),
-            'thumbnail': data.get('thumbnail_url'),
-        }, None
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(video_url, download=False)
+            
+            subtitles = info.get('subtitles', {})
+            automatic_captions = info.get('automatic_captions', {})
+            
+            transcript_text = None
+            language = None
+            
+            # Priorité : français manuel, anglais manuel, français auto, anglais auto
+            for lang in ['fr', 'en']:
+                if lang in subtitles:
+                    subs = subtitles[lang]
+                    if subs:
+                        sub_url = subs[0]['url']
+                        import requests
+                        response = requests.get(sub_url)
+                        transcript_text = response.text
+                        language = lang
+                        break
+            
+            if not transcript_text:
+                for lang in ['fr', 'en']:
+                    if lang in automatic_captions:
+                        subs = automatic_captions[lang]
+                        if subs:
+                            sub_url = subs[0]['url']
+                            import requests
+                            response = requests.get(sub_url)
+                            transcript_text = response.text
+                            language = lang
+                            break
+            
+            if not transcript_text:
+                return None, "Aucune transcription disponible", None
+            
+            # Parser le VTT/SRT pour extraire le texte
+            lines = transcript_text.split('\n')
+            text_only = []
+            for line in lines:
+                line = line.strip()
+                if line and not line.startswith('WEBVTT') and not '-->' in line and not line.isdigit():
+                    text_only.append(line)
+            
+            final_text = ' '.join(text_only)
+            
+            metadata = {
+                'title': info.get('title'),
+                'channel': info.get('uploader'),
+                'duration': info.get('duration'),
+                'thumbnail': info.get('thumbnail'),
+            }
+            
+            return final_text, metadata, language
+            
     except Exception as e:
-        logger.error(f"Erreur métadonnées: {str(e)}")
-        return None, str(e)
+        logger.error(f"Erreur extraction: {str(e)}")
+        return None, str(e), None
 
-def generate_summary_with_gemini(video_url, style='structured'):
-    """Génère un résumé avec Gemini en analysant directement la vidéo YouTube"""
+def generate_summary(transcript, metadata, style='structured'):
+    """Génère un résumé avec Gemini"""
     
     prompts = {
-        'structured': f"""Analyse cette vidéo YouTube et crée un résumé structuré en français.
+        'structured': f"""Analyse cette transcription vidéo et crée un résumé structuré en français.
 
-URL: {video_url}
+Titre: {metadata.get('title')}
 
-FORMAT EXACT À SUIVRE:
+TRANSCRIPTION:
+{transcript[:4000]}
+
+FORMAT:
 ## 📝 Résumé Principal
-[2-3 phrases de synthèse globale]
+[2-3 phrases]
 
 ## 🎯 Points Clés
-- Point important 1
-- Point important 2
-- Point important 3
+- Point 1
+- Point 2
+- Point 3
 
 ## 💡 Idées Principales
-[Développement des concepts clés abordés dans la vidéo]
+[Développement]
 
 ## 🔑 Conclusion
-[Takeaway principal en 1-2 phrases]
-
-Réponds uniquement en français, en suivant exactement cette structure.""",
+[Takeaway]""",
         
-        'bullets': f"""Analyse cette vidéo YouTube et résume-la en bullet points concis en français.
+        'bullets': f"""Résume en 5-7 bullet points en français.
 
-URL: {video_url}
-
-Fournis 5-7 points clés numérotés qui capturent l'essentiel du contenu de la vidéo.
-Réponds uniquement en français.""",
+{transcript[:4000]}""",
         
-        'paragraph': f"""Analyse cette vidéo YouTube et écris un paragraphe de résumé fluide en français.
+        'paragraph': f"""Résumé en 1 paragraphe fluide en français (4-6 phrases).
 
-URL: {video_url}
-
-Rédige 1 paragraphe de 4-6 phrases qui résume l'essentiel de la vidéo de manière naturelle.
-Réponds uniquement en français."""
+{transcript[:4000]}"""
     }
     
     try:
-        # Utiliser Gemini 1.5 Flash (le moins cher et suffisant)
         model = genai.GenerativeModel('gemini-pro')
-        
         prompt = prompts.get(style, prompts['structured'])
         
-        logger.info(f"Envoi requête Gemini pour {video_url}")
         response = model.generate_content(prompt)
-        
-        summary = response.text
-        logger.info(f"Résumé reçu: {len(summary)} caractères")
-        
-        return summary, None
+        return response.text, None
         
     except Exception as e:
         logger.error(f"Erreur Gemini: {str(e)}")
@@ -115,7 +156,7 @@ def health_check():
     return jsonify({
         'status': 'healthy',
         'service': 'quicktube-backend',
-        'version': 'gemini-api',
+        'version': 'yt-dlp-gemini',
         'timestamp': datetime.utcnow().isoformat()
     })
 
@@ -130,12 +171,11 @@ def process_video():
         if not video_url or not user_id:
             return jsonify({'error': 'video_url et user_id requis'}), 400
         
-        # Extraire l'ID vidéo
         video_id = extract_video_id(video_url)
         if not video_id:
             return jsonify({'error': 'URL YouTube invalide'}), 400
         
-        # Vérifier les crédits
+        # Vérifier crédits
         user_response = supabase.table('profiles').select('credits_remaining, tier').eq('id', user_id).single().execute()
         
         if not user_response.data:
@@ -146,36 +186,33 @@ def process_video():
         if credits <= 0:
             return jsonify({'error': 'Crédits épuisés'}), 403
         
-        # Récupérer les métadonnées de base
-        logger.info(f"Récupération métadonnées pour video_id={video_id}")
-        metadata, error = get_video_metadata(video_id)
+        # Extraire transcription
+        logger.info(f"Extraction transcription pour {video_url}")
+        transcript, metadata_or_error, language = get_transcript(video_url)
         
-        if error:
-            # Si les métadonnées échouent, on continue quand même avec Gemini
-            metadata = {
-                'title': 'Vidéo YouTube',
-                'channel': 'Inconnu',
-                'thumbnail': f'https://img.youtube.com/vi/{video_id}/hqdefault.jpg'
-            }
+        if not transcript:
+            return jsonify({'error': f'Extraction échouée: {metadata_or_error}'}), 500
         
-        # Générer le résumé avec Gemini (analyse directe de la vidéo)
-        logger.info(f"Génération résumé Gemini style={style}")
-        summary, error = generate_summary_with_gemini(video_url, style)
+        metadata = metadata_or_error
+        
+        # Générer résumé
+        logger.info(f"Génération résumé Gemini")
+        summary, error = generate_summary(transcript, metadata, style)
         
         if error:
             return jsonify({'error': f'Résumé échoué: {error}'}), 500
         
-        # Sauvegarder en base
+        # Sauvegarder
         summary_record = {
             'user_id': user_id,
             'video_url': video_url,
             'video_title': metadata.get('title'),
-            'video_duration': None,
+            'video_duration': metadata.get('duration'),
             'thumbnail_url': metadata.get('thumbnail'),
             'channel_name': metadata.get('channel'),
-            'transcript': summary,
+            'transcript': transcript,
             'summary': summary,
-            'language': 'fr',
+            'language': language,
             'style': style,
             'created_at': datetime.utcnow().isoformat()
         }

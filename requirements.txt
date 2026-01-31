@@ -1,5 +1,6 @@
 flask==3.0.0
 flask-cors==4.0.0
+yt-dlp==2024.8.6
 supabase==2.7.4
 python-dotenv==1.0.0
 gunicorn==21.2.0
