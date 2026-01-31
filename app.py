@@ -314,17 +314,3 @@ if __name__ == '__main__':
     
     port = int(os.getenv('PORT', 8080))
     app.run(host='0.0.0.0', port=port, debug=False)
-```
-
----
-
-## 📦 ÉTAPE 3 : Mettre à jour requirements.txt
-```
-flask==3.0.0
-flask-cors==4.0.0
-openai==1.54.3
-supabase==2.7.4
-python-dotenv==1.0.0
-gunicorn==21.2.0
-requests>=2.32.2
-youtube-transcript-api==0.6.2
