@@ -170,10 +170,10 @@ def process_video():
             'user_id': user_id,
             'video_url': video_url,
             'video_title': metadata.get('title'),
-            'video_duration': None,  # Gemini ne retourne pas la durée
+            'video_duration': None,
             'thumbnail_url': metadata.get('thumbnail'),
             'channel_name': metadata.get('channel'),
-            'transcript': summary,  # On stocke le résumé comme "transcript"
+            'transcript': summary,
             'summary': summary,
             'language': 'fr',
             'style': style,
@@ -211,5 +211,3 @@ if __name__ == '__main__':
     
     port = int(os.getenv('PORT', 8080))
     app.run(host='0.0.0.0', port=port, debug=False)
-```
-
