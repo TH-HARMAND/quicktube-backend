@@ -94,7 +94,7 @@ Réponds uniquement en français."""
     
     try:
         # Utiliser Gemini 1.5 Flash (le moins cher et suffisant)
-        model = genai.GenerativeModel('gemini-1.5-flash-latest')
+        model = genai.GenerativeModel('models/gemini-1.5-flash-002')
         
         prompt = prompts.get(style, prompts['structured'])
         
